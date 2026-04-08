@@ -1,0 +1,239 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{subcaption}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\title{Adaptive Vision Pipeline:\\
+       Classification, Detection \& Segmentation}
+\author{Khaled Koubaa}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ══════════════════════════════════════════════════════════════════
+\begin{abstract}
+We present an end-to-end computer-vision pipeline that unifies image
+classification, object detection, and instance segmentation within a single
+config-driven framework.  Built on PyTorch and OpenCV, the system leverages a
+shared ResNet-50 backbone with task-specific heads—Faster~R-CNN for detection
+and Mask~R-CNN for segmentation—allowing pixel-level masks to be toggled on
+whenever they improve downstream accuracy.  We detail the architecture,
+training procedure, evaluation protocol, and experimental results on a custom
+dataset.
+\end{abstract}
+
+% ══════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:intro}
+
+Modern vision systems increasingly require \emph{multi-granularity}
+understanding of scenes: recognising \emph{what} is in an image
+(classification), \emph{where} objects are located (detection), and
+\emph{which pixels} belong to each instance (segmentation).  Rather than
+maintaining three independent code-bases, this project exposes a unified
+pipeline whose behaviour is controlled by a single YAML configuration file.
+
+\paragraph{Contributions.}
+\begin{enumerate}[nosep]
+  \item A modular Python pipeline supporting three vision tasks with a shared
+        backbone.
+  \item OpenCV-based preprocessing with geometric and photometric
+        augmentations that respect bounding-box and mask annotations.
+  \item Comprehensive evaluation: confusion matrices (classification),
+        mAP/IoU curves (detection), and mask-mAP (segmentation).
+  \item Reproducible experiments with deterministic seeding, mixed-precision
+        training, and early stopping.
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Backbone Architecture}
+
+All three tasks share a ResNet-50~\cite{he2016deep} feature extractor
+pretrained on ImageNet~\cite{deng2009imagenet}.  For detection and
+segmentation, a Feature Pyramid Network (FPN)~\cite{lin2017feature} is added
+to produce multi-scale feature maps.
+
+\subsection{Classification Head}
+
+The global average-pooled features $\mathbf{z}\in\mathbb{R}^{2048}$ are
+passed through a linear classifier:
+\begin{equation}
+  \hat{y} = \arg\max_{c}\;\mathbf{W}_c^\top \mathbf{z} + b_c\,,
+  \quad c \in \{1,\dots,C\}
+  \label{eq:cls}
+\end{equation}
+trained with the cross-entropy loss:
+\begin{equation}
+  \mathcal{L}_{\text{cls}} = -\frac{1}{N}\sum_{i=1}^{N}
+    \log\frac{\exp(f_{y_i}(\mathbf{x}_i))}
+             {\sum_{c=1}^{C}\exp(f_c(\mathbf{x}_i))}
+  \label{eq:ce}
+\end{equation}
+
+\subsection{Detection Head (Faster R-CNN)}
+
+Faster R-CNN~\cite{ren2015faster} adds a Region Proposal Network (RPN) on
+top of the FPN features.  The RPN proposes candidate bounding boxes that are
+refined and classified by the RoI (Region of Interest) head.
+
+\paragraph{RPN loss.}  Each anchor is assigned a binary label
+$y^*\!\in\{0,1\}$ and a regression target
+$\mathbf{t}^*\!=\!(t_x^*,t_y^*,t_w^*,t_h^*)$:
+\begin{equation}
+  \mathcal{L}_{\text{RPN}} =
+    \frac{1}{N_{\text{cls}}}\sum_i \mathcal{L}_{\text{cls}}(p_i, y_i^*)
+    + \lambda\,\frac{1}{N_{\text{reg}}}\sum_i y_i^*\,
+      \text{smooth}_{L_1}(\mathbf{t}_i - \mathbf{t}_i^*)
+  \label{eq:rpn}
+\end{equation}
+
+\paragraph{RoI head loss.}  Proposals are pooled to fixed-size features via
+RoI Align~\cite{he2017mask} and fed to fully-connected layers for
+classification and bounding-box regression.
+
+\subsection{Segmentation Head (Mask R-CNN)}
+
+Mask R-CNN~\cite{he2017mask} extends Faster R-CNN with a parallel mask
+branch that predicts a binary mask for each detected instance:
+\begin{equation}
+  \mathcal{L}_{\text{mask}} =
+    -\frac{1}{m^2}\sum_{1\le i,j\le m}
+    \bigl[y_{ij}\log\hat{m}_{ij}
+          + (1-y_{ij})\log(1-\hat{m}_{ij})\bigr]
+  \label{eq:mask}
+\end{equation}
+where $m\times m$ is the mask resolution and $\hat{m}_{ij}$ is the predicted
+probability for pixel $(i,j)$.  This head is \emph{only activated} when the
+configuration flag \texttt{enable\_masks} is set to \texttt{true}.
+
+\subsection{Evaluation Metrics}
+
+\paragraph{Classification.}  Accuracy, macro-averaged precision, recall,
+$F_1$-score, and the full confusion matrix.
+
+\paragraph{Detection.}  Mean Average Precision at IoU threshold~$\theta$:
+\begin{equation}
+  \text{AP}_c = \int_0^1 p_c(r)\,dr\,,
+  \qquad
+  \text{mAP} = \frac{1}{C}\sum_{c=1}^{C}\text{AP}_c
+  \label{eq:map}
+\end{equation}
+where $p_c(r)$ is the precision--recall curve for class~$c$.
+
+\paragraph{Segmentation.}  Mask-mAP is computed identically but using mask
+IoU instead of box IoU:
+\begin{equation}
+  \text{IoU}_{\text{mask}} =
+    \frac{|M_{\text{pred}} \cap M_{\text{gt}}|}
+         {|M_{\text{pred}} \cup M_{\text{gt}}|}
+  \label{eq:mask_iou}
+\end{equation}
+
+% ══════════════════════════════════════════════════════════════════
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Hyper-parameters}
+
+\begin{table}[h]
+\centering
+\caption{Training hyper-parameters per task.}
+\label{tab:hyper}
+\begin{tabular}{lccc}
+\toprule
+Parameter          & Classification & Detection & Segmentation \\
+\midrule
+Backbone           & ResNet-50      & ResNet-50-FPN & ResNet-50-FPN \\
+Input size         & $224\times224$ & $640\times640$ & $640\times640$ \\
+Batch size         & 32             & 4              & 2 \\
+Optimiser          & SGD            & SGD            & SGD \\
+Learning rate      & $10^{-3}$      & $5\times10^{-3}$ & $5\times10^{-3}$ \\
+Weight decay       & $10^{-4}$      & $5\times10^{-4}$ & $5\times10^{-4}$ \\
+LR schedule        & Cosine         & StepLR (15)    & StepLR (15) \\
+Epochs             & 30             & 50             & 50 \\
+Early stopping     & 10 epochs      & 15 epochs      & 15 epochs \\
+Mixed precision    & Yes            & Yes            & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Data Augmentation}
+
+All augmentations are implemented in OpenCV:
+\begin{itemize}[nosep]
+  \item Resize to target resolution (bilinear interpolation).
+  \item Random horizontal flip ($p=0.5$) with box/mask coordinate adjustment.
+  \item Random brightness and contrast jitter ($\pm20\%$).
+  \item ImageNet channel-wise normalisation ($\mu$, $\sigma$).
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════
+\section{Results}
+\label{sec:results}
+
+\textit{(Fill in after running experiments on target dataset.)}
+
+\begin{figure}[h]
+  \centering
+  % \includegraphics[width=0.9\textwidth]{figures/training_curves.png}
+  \caption{Training and validation loss/metric curves over epochs.}
+  \label{fig:curves}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  % \includegraphics[width=0.6\textwidth]{figures/confusion_matrix.png}
+  \caption{Confusion matrix on the validation set (classification task).}
+  \label{fig:cm}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  % \includegraphics[width=0.9\textwidth]{figures/prediction_grid.png}
+  \caption{Sample detection/segmentation predictions on validation images.}
+  \label{fig:preds}
+\end{figure}
+
+% ══════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discuss}
+
+The modular design allows rapid experimentation: switching from detection to
+segmentation requires changing a single flag (\texttt{enable\_masks:~true})
+in the configuration file.  The Mask~R-CNN head adds minimal overhead to
+Faster~R-CNN while providing pixel-level instance boundaries that can
+improve downstream applications such as measurement, counting, or
+quality inspection.
+
+% ══════════════════════════════════════════════════════════════════
+\section{Conclusion}
+\label{sec:conclusion}
+
+We demonstrated a reproducible, config-driven pipeline for multi-task visual
+understanding.  The shared ResNet-50/FPN backbone keeps inference efficient,
+while task-specific heads allow flexible deployment depending on application
+requirements.  All code, trained weights, and this report are provided for
+full reproducibility.
+
+% ══════════════════════════════════════════════════════════════════
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
